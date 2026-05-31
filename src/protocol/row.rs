@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use sqlx_core::column::Column;
 use sqlx_core::Error;
 use std::sync::Arc;
@@ -10,6 +11,7 @@ pub(crate) struct Row;
 
 impl Row {
     pub(crate) fn get(
+        payload: &Bytes,
         input: &mut &[u8],
         nullable: bool,
         columns: Arc<[MssqlColumn]>,
@@ -31,7 +33,7 @@ impl Row {
                     Error::Protocol(format!("missing protocol type info for {type_info}"))
                 })?;
                 let data = protocol_type_info
-                    .get_value(input)
+                    .get_value(payload, input)
                     .map_err(|error| Error::Protocol(error.to_string()))?;
                 MssqlValue::new(type_info.clone(), data)
             };

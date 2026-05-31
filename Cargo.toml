@@ -13,6 +13,7 @@ rust-version = "1.94.0"
 [features]
 default = []
 integration-tests = []
+runtime-tokio = ["sqlx-core/_rt-tokio"]
 migrate = ["sqlx-core/migrate"]
 chrono = ["dep:chrono", "sqlx-core/chrono"]
 time = ["dep:time", "sqlx-core/time"]
@@ -22,6 +23,7 @@ decimal = ["dep:rust_decimal", "sqlx-core/rust_decimal"]
 bigdecimal = ["dep:bigdecimal", "dep:num-bigint", "sqlx-core/bigdecimal"]
 
 [dependencies]
+bytes = "1"
 futures-core = { version = "0.3.32", default-features = false }
 futures-util = { version = "0.3.32", default-features = false, features = ["alloc"] }
 log = "0.4"

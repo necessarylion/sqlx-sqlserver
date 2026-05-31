@@ -1,14 +1,17 @@
 use futures_core::future::BoxFuture;
-use futures_core::stream::BoxStream;
-use futures_util::{future, stream, StreamExt};
+use futures_core::stream::{BoxStream, Stream};
+use futures_util::{future, stream, StreamExt, TryStreamExt};
 use native_tls::Certificate;
 use sqlx_core::connection::Connection;
 use sqlx_core::decode::Decode;
 use sqlx_core::error::Error;
 use sqlx_core::executor::{Execute, Executor};
+use sqlx_core::sql_str::SqlStr;
 use sqlx_core::transaction::Transaction;
 use sqlx_core::value::Value;
 use sqlx_core::Either;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_native_tls::TlsConnector;
@@ -17,7 +20,9 @@ use crate::error::server_error;
 use crate::protocol::login::build_login7_packet;
 use crate::protocol::packet::{PacketHeader, PacketStatus, PacketType, PACKET_HEADER_LEN};
 use crate::protocol::pre_login::{build_pre_login_packet, parse_server_encrypt};
-use crate::protocol::query::{build_sql_batch_packet, parse_query_response, QueryOutput};
+use crate::protocol::query::{
+    build_sql_batch_packet, parse_query_response, QueryEvent, QueryEvents, QueryOutput,
+};
 use crate::protocol::rpc::{
     build_execute_sql_packet, build_prepare_packet, build_unprepare_packet,
 };
@@ -115,26 +120,37 @@ impl MssqlConnection {
 
     fn apply_env_changes(&mut self, env_changes: &[EnvChange]) {
         for change in env_changes {
-            match change {
-                EnvChange::PacketSize(size) => {
-                    if let Some(stream) = self.stream.as_mut() {
-                        stream.packet_size = (*size).clamp(512, 32767) as usize;
-                    }
+            self.apply_env_change(change);
+        }
+    }
+
+    fn apply_env_change(&mut self, env_change: &EnvChange) {
+        match env_change {
+            EnvChange::PacketSize(size) => {
+                if let Some(stream) = self.stream.as_mut() {
+                    stream.packet_size = (*size).clamp(512, 32767) as usize;
                 }
-                EnvChange::BeginTransaction(descriptor) => {
-                    self.transaction_descriptor = *descriptor;
-                }
-                EnvChange::CommitTransaction(_) | EnvChange::RollbackTransaction(_) => {
-                    self.transaction_descriptor = 0;
-                }
-                _ => {}
             }
+            EnvChange::BeginTransaction(descriptor) => {
+                self.transaction_descriptor = *descriptor;
+            }
+            EnvChange::CommitTransaction(_) | EnvChange::RollbackTransaction(_) => {
+                self.transaction_descriptor = 0;
+            }
+            _ => {}
         }
     }
 
     /// Returns the current transaction depth tracked by the connection.
     pub const fn transaction_depth(&self) -> usize {
         self.transaction_depth
+    }
+
+    /// Begins a transaction on this connection.
+    pub fn begin(
+        &mut self,
+    ) -> impl std::future::Future<Output = Result<Transaction<'_, Mssql>, Error>> + Send + '_ {
+        <Self as Connection>::begin(self)
     }
 
     pub(crate) fn increment_transaction_depth(&mut self) {
@@ -192,11 +208,21 @@ impl MssqlConnection {
         Ok(())
     }
 
-    pub(crate) async fn run_execute_sql(
+    async fn run_execute_sql_events(
         &mut self,
         sql: &str,
         arguments: Option<&MssqlArguments>,
-    ) -> Result<QueryOutput, Error> {
+    ) -> Result<QueryEvents, Error> {
+        let operation = self.send_execute_sql(sql, arguments).await?;
+        let payload = self.read_query_response_payload(operation).await?;
+        Ok(QueryEvents::new(payload))
+    }
+
+    async fn send_execute_sql(
+        &mut self,
+        sql: &str,
+        arguments: Option<&MssqlArguments>,
+    ) -> Result<&'static str, Error> {
         self.flush_pending_rollback().await?;
 
         match arguments {
@@ -215,9 +241,19 @@ impl MssqlConnection {
                 stream.write_all(&packet).await.map_err(|error| {
                     context_error("failed to send SQL Server RPC execute packet", error)
                 })?;
-                self.read_query_response("RPC execute").await
+                Ok("RPC execute")
             }
-            _ => self.run_sql_batch_direct(sql).await,
+            _ => {
+                let transaction_descriptor = self.transaction_descriptor;
+                let stream = self.stream.as_mut().ok_or_else(wire_not_implemented)?;
+                let packet =
+                    build_sql_batch_packet(sql, stream.packet_size, transaction_descriptor)
+                        .map_err(frame_error)?;
+                stream.write_all(&packet).await.map_err(|error| {
+                    context_error("failed to send SQL Server SQL batch packet", error)
+                })?;
+                Ok("SQL batch")
+            }
         }
     }
 
@@ -261,6 +297,20 @@ impl MssqlConnection {
     }
 
     async fn read_query_response(&mut self, operation: &'static str) -> Result<QueryOutput, Error> {
+        let payload = self.read_query_response_payload(operation).await?;
+        let output = parse_query_response(&payload).map_err(|error| {
+            Error::Protocol(format!(
+                "failed to parse SQL Server {operation} response: {error}"
+            ))
+        })?;
+        self.apply_env_changes(&output.env_changes);
+        Ok(output)
+    }
+
+    async fn read_query_response_payload(
+        &mut self,
+        operation: &'static str,
+    ) -> Result<Vec<u8>, Error> {
         let stream = self.stream.as_mut().ok_or_else(wire_not_implemented)?;
         let response = stream.read_message().await.map_err(|error| {
             context_error(
@@ -275,13 +325,27 @@ impl MssqlConnection {
             )));
         }
 
-        let output = parse_query_response(&response.payload).map_err(|error| {
-            Error::Protocol(format!(
-                "failed to parse SQL Server {operation} response: {error}"
-            ))
-        })?;
-        self.apply_env_changes(&output.env_changes);
-        Ok(output)
+        Ok(response.payload)
+    }
+
+    pub(crate) fn fetch_many_sql<'e>(
+        &'e mut self,
+        sql: SqlStr,
+        arguments: Result<Option<MssqlArguments>, Error>,
+    ) -> BoxStream<'e, Result<Either<MssqlQueryResult, MssqlRow>, Error>> {
+        stream::once(async move {
+            let arguments = arguments?;
+            let events = self
+                .run_execute_sql_events(sql.as_str(), arguments.as_ref())
+                .await?;
+            Ok((self, events))
+        })
+        .map(|result| match result {
+            Ok((conn, events)) => QueryEventStream { conn, events }.boxed(),
+            Err(error) => stream::once(future::ready(Err(error))).boxed(),
+        })
+        .flatten()
+        .boxed()
     }
 }
 
@@ -350,40 +414,26 @@ impl<'c> Executor<'c> for &'c mut MssqlConnection {
     {
         let arguments = query.take_arguments().map_err(Error::Encode);
         let sql = query.sql();
-
-        stream::once(async move {
-            let arguments = arguments?;
-            self.run_execute_sql(sql.as_str(), arguments.as_ref()).await
-        })
-        .map(|result| match result {
-            Ok(output) => stream_query_output(output),
-            Err(error) => stream::once(future::ready(Err(error))).boxed(),
-        })
-        .flatten()
-        .boxed()
+        self.fetch_many_sql(sql, arguments)
     }
 
-    fn fetch_optional<'e, 'q, E>(
-        self,
-        mut query: E,
-    ) -> BoxFuture<'e, Result<Option<MssqlRow>, Error>>
+    fn fetch_optional<'e, 'q, E>(self, query: E) -> BoxFuture<'e, Result<Option<MssqlRow>, Error>>
     where
         'c: 'e,
         E: Execute<'q, Self::Database>,
         'q: 'e,
         E: 'q,
     {
-        let arguments = query.take_arguments().map_err(Error::Encode);
-        let sql = query.sql();
+        let mut stream = self.fetch_many(query);
 
         Box::pin(async move {
-            let arguments = arguments?;
-            Ok(self
-                .run_execute_sql(sql.as_str(), arguments.as_ref())
-                .await?
-                .rows
-                .into_iter()
-                .next())
+            while let Some(value) = stream.try_next().await? {
+                if let Either::Right(row) = value {
+                    return Ok(Some(row));
+                }
+            }
+
+            Ok(None)
         })
     }
 
@@ -738,17 +788,30 @@ fn context_error(context: impl Into<String>, error: Error) -> Error {
     }
 }
 
-fn stream_query_output(
-    output: QueryOutput,
-) -> BoxStream<'static, Result<Either<MssqlQueryResult, MssqlRow>, Error>> {
-    stream::iter(
-        output
-            .rows
-            .into_iter()
-            .map(|row| Ok(Either::Right(row)))
-            .chain(std::iter::once(Ok(Either::Left(output.result)))),
-    )
-    .boxed()
+struct QueryEventStream<'c> {
+    conn: &'c mut MssqlConnection,
+    events: QueryEvents,
+}
+
+impl Stream for QueryEventStream<'_> {
+    type Item = Result<Either<MssqlQueryResult, MssqlRow>, Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            match self.events.next() {
+                Ok(Some(QueryEvent::Columns(_))) | Ok(Some(QueryEvent::ReturnValue(_))) => {}
+                Ok(Some(QueryEvent::EnvChange(env_change))) => {
+                    self.conn.apply_env_change(&env_change);
+                }
+                Ok(Some(QueryEvent::Row(row))) => return Poll::Ready(Some(Ok(Either::Right(row)))),
+                Ok(Some(QueryEvent::Result(result))) => {
+                    return Poll::Ready(Some(Ok(Either::Left(result))));
+                }
+                Ok(None) => return Poll::Ready(None),
+                Err(error) => return Poll::Ready(Some(Err(error))),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

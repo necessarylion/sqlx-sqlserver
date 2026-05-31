@@ -1,5 +1,6 @@
 use std::fmt::Write;
 
+use bytes::Bytes;
 use sqlx_core::encode::{Encode, IsNull};
 use sqlx_core::error::BoxDynError;
 
@@ -312,7 +313,11 @@ impl TypeInfo {
         )
     }
 
-    pub(crate) fn get_value(&self, input: &mut &[u8]) -> Result<Option<Vec<u8>>, TypeInfoError> {
+    pub(crate) fn get_value(
+        &self,
+        payload: &Bytes,
+        input: &mut &[u8],
+    ) -> Result<Option<Bytes>, TypeInfoError> {
         Ok(match self.ty {
             DataType::Null => None,
 
@@ -326,7 +331,7 @@ impl TypeInfo {
             | DataType::DateTime
             | DataType::Float
             | DataType::SmallMoney
-            | DataType::BigInt => Some(take(input, self.size as usize)?.to_vec()),
+            | DataType::BigInt => Some(take_shared(payload, input, self.size as usize)?),
 
             DataType::Guid
             | DataType::IntN
@@ -347,7 +352,7 @@ impl TypeInfo {
                 if size == 0 || size == 0xff {
                     None
                 } else {
-                    Some(take(input, usize::from(size))?.to_vec())
+                    Some(take_shared(payload, input, usize::from(size))?)
                 }
             }
 
@@ -356,7 +361,7 @@ impl TypeInfo {
                 if size == 0xff {
                     None
                 } else {
-                    Some(take(input, usize::from(size))?.to_vec())
+                    Some(take_shared(payload, input, usize::from(size))?)
                 }
             }
 
@@ -375,7 +380,7 @@ impl TypeInfo {
                     if size == 0xffff {
                         None
                     } else {
-                        Some(take(input, usize::from(size))?.to_vec())
+                        Some(take_shared(payload, input, usize::from(size))?)
                     }
                 }
             }
@@ -386,13 +391,13 @@ impl TypeInfo {
                 if size == 0xffff_ffff {
                     None
                 } else {
-                    Some(take(input, usize::try_from(size).unwrap())?.to_vec())
+                    Some(take_shared(payload, input, usize::try_from(size).unwrap())?)
                 }
             }
         })
     }
 
-    pub(crate) fn get_big_blob(&self, input: &mut &[u8]) -> Result<Option<Vec<u8>>, TypeInfoError> {
+    pub(crate) fn get_big_blob(&self, input: &mut &[u8]) -> Result<Option<Bytes>, TypeInfoError> {
         // Unknown size, length-prefixed blobs.
         let len = read_u64_le(input)?;
 
@@ -415,7 +420,7 @@ impl TypeInfo {
             data.extend_from_slice(take(input, chunk_size)?);
         }
 
-        Ok(Some(data))
+        Ok(Some(Bytes::from(data)))
     }
 
     pub(crate) fn put_value<'q, T: Encode<'q, Mssql>>(
@@ -743,6 +748,19 @@ impl TypeInfo {
     }
 }
 
+fn take_shared(payload: &Bytes, input: &mut &[u8], len: usize) -> Result<Bytes, TypeInfoError> {
+    let start = payload
+        .len()
+        .checked_sub(input.len())
+        .ok_or(TypeInfoError::UnexpectedEof)?;
+    take(input, len)?;
+    let end = payload
+        .len()
+        .checked_sub(input.len())
+        .ok_or(TypeInfoError::UnexpectedEof)?;
+    Ok(payload.slice(start..end))
+}
+
 impl DataType {
     pub(crate) fn get(input: &mut &[u8]) -> Result<Self, TypeInfoError> {
         Ok(match read_u8(input)? {
@@ -864,7 +882,7 @@ mod tests {
 
     #[test]
     fn parses_type_info_and_value_with_old_wire_constants() {
-        let mut input = &[
+        let payload = Bytes::copy_from_slice(&[
             DataType::IntN as u8,
             4,
             4,
@@ -885,14 +903,15 @@ mod tests {
             0,
             0,
             0,
-        ][..];
+        ]);
+        let mut input = payload.as_ref();
 
         let type_info = TypeInfo::get(&mut input).unwrap();
 
         assert_eq!(type_info, TypeInfo::new(DataType::IntN, 4));
         assert_eq!(
-            Some(vec![1, 0, 0, 0]),
-            type_info.get_value(&mut input).unwrap()
+            Some(Bytes::from_static(&[1, 0, 0, 0])),
+            type_info.get_value(&payload, &mut input).unwrap()
         );
     }
 
@@ -940,10 +959,11 @@ mod tests {
         assert_eq!(&[4, 0, 0, 0], &out[8..12]);
         assert_eq!(&[0, 0, 0, 0], &out[out.len() - 4..]);
 
-        let mut input = out.as_slice();
+        let payload = Bytes::copy_from_slice(&out);
+        let mut input = payload.as_ref();
         assert_eq!(
-            Some(vec![b'h', 0, b'i', 0]),
-            type_info.get_value(&mut input).unwrap()
+            Some(Bytes::from_static(&[b'h', 0, b'i', 0])),
+            type_info.get_value(&payload, &mut input).unwrap()
         );
         assert!(input.is_empty());
     }
@@ -973,10 +993,15 @@ mod tests {
         assert_eq!(vec![PLP_CHUNK_SIZE, PLP_CHUNK_SIZE, 2], chunk_sizes);
         assert!(input.is_empty());
 
-        let mut input = out.as_slice();
+        let payload = Bytes::copy_from_slice(&out);
+        let mut input = payload.as_ref();
         assert_eq!(
             expected_len,
-            type_info.get_value(&mut input).unwrap().unwrap().len()
+            type_info
+                .get_value(&payload, &mut input)
+                .unwrap()
+                .unwrap()
+                .len()
         );
         assert!(input.is_empty());
     }
@@ -992,8 +1017,9 @@ mod tests {
 
         assert_eq!(PLP_NULL.to_le_bytes(), out.as_slice());
 
-        let mut input = out.as_slice();
-        assert_eq!(None, type_info.get_value(&mut input).unwrap());
+        let payload = Bytes::copy_from_slice(&out);
+        let mut input = payload.as_ref();
+        assert_eq!(None, type_info.get_value(&payload, &mut input).unwrap());
         assert!(input.is_empty());
     }
 

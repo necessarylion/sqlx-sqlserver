@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use bytes::Bytes;
 use sqlx_core::decode::Decode;
 use sqlx_core::encode::{Encode, IsNull};
 use sqlx_core::error::BoxDynError;
@@ -13,12 +14,12 @@ use crate::{Mssql, MssqlType, MssqlTypeInfo};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MssqlValue {
     type_info: MssqlTypeInfo,
-    data: Option<Vec<u8>>,
+    data: Option<Bytes>,
 }
 
 impl MssqlValue {
     /// Creates an owned value from type information and raw little-endian TDS bytes.
-    pub(crate) fn new(type_info: MssqlTypeInfo, data: Option<Vec<u8>>) -> Self {
+    pub(crate) fn new(type_info: MssqlTypeInfo, data: Option<Bytes>) -> Self {
         Self { type_info, data }
     }
 
@@ -37,7 +38,7 @@ impl Value for MssqlValue {
     fn as_ref(&self) -> MssqlValueRef<'_> {
         MssqlValueRef {
             type_info: &self.type_info,
-            data: self.data.as_deref(),
+            data: self.data.as_ref().map(Bytes::as_ref),
         }
     }
 
@@ -63,7 +64,7 @@ impl<'r> ValueRef<'r> for MssqlValueRef<'r> {
     fn to_owned(&self) -> MssqlValue {
         MssqlValue {
             type_info: self.type_info.clone(),
-            data: self.data.map(ToOwned::to_owned),
+            data: self.data.map(Bytes::copy_from_slice),
         }
     }
 
@@ -540,6 +541,16 @@ impl Decode<'_, Mssql> for String {
     }
 }
 
+impl<'r> Decode<'r, Mssql> for &'r str {
+    fn decode(value: MssqlValueRef<'r>) -> Result<Self, BoxDynError> {
+        if !matches!(value.type_info.kind(), MssqlType::VarChar) {
+            return Err("borrowed SQL Server &str decoding is only supported for VARCHAR; NVARCHAR requires UTF-16 allocation".into());
+        }
+
+        Ok(std::str::from_utf8(non_null_bytes(value, "&str")?)?)
+    }
+}
+
 impl Type<Mssql> for [u8] {
     fn type_info() -> MssqlTypeInfo {
         MssqlTypeInfo::VARBINARY
@@ -648,16 +659,25 @@ mod tests {
 
     #[test]
     fn decodes_integer_scalars_with_range_checks() {
-        let value = MssqlValue::new(MssqlTypeInfo::INT, Some(65_535_i32.to_le_bytes().to_vec()));
+        let value = MssqlValue::new(
+            MssqlTypeInfo::INT,
+            Some(Bytes::from(65_535_i32.to_le_bytes().to_vec())),
+        );
         assert_eq!(
             65_535_u16,
             <u16 as Decode<Mssql>>::decode(value.as_ref()).unwrap()
         );
 
-        let negative = MssqlValue::new(MssqlTypeInfo::INT, Some((-1_i32).to_le_bytes().to_vec()));
+        let negative = MssqlValue::new(
+            MssqlTypeInfo::INT,
+            Some(Bytes::from((-1_i32).to_le_bytes().to_vec())),
+        );
         assert!(<u16 as Decode<Mssql>>::decode(negative.as_ref()).is_err());
 
-        let too_large = MssqlValue::new(MssqlTypeInfo::INT, Some(128_i32.to_le_bytes().to_vec()));
+        let too_large = MssqlValue::new(
+            MssqlTypeInfo::INT,
+            Some(Bytes::from(128_i32.to_le_bytes().to_vec())),
+        );
         assert!(<i8 as Decode<Mssql>>::decode(too_large.as_ref()).is_err());
     }
 
@@ -665,7 +685,7 @@ mod tests {
     fn integer_scalars_are_compatible_with_decimal() {
         let mut numeric = vec![1_u8];
         numeric.extend_from_slice(&42_u128.to_le_bytes());
-        let value = MssqlValue::new(MssqlTypeInfo::DECIMAL, Some(numeric));
+        let value = MssqlValue::new(MssqlTypeInfo::DECIMAL, Some(Bytes::from(numeric)));
 
         assert!(<i64 as Type<Mssql>>::compatible(&MssqlTypeInfo::DECIMAL));
         assert_eq!(
@@ -676,7 +696,10 @@ mod tests {
 
     #[test]
     fn decodes_borrowed_bytes() {
-        let value = MssqlValue::new(MssqlTypeInfo::VARBINARY, Some(vec![1, 2, 3, 4]));
+        let value = MssqlValue::new(
+            MssqlTypeInfo::VARBINARY,
+            Some(Bytes::from(vec![1, 2, 3, 4])),
+        );
         let bytes = <&[u8] as Decode<Mssql>>::decode(value.as_ref()).unwrap();
 
         assert_eq!(&[1, 2, 3, 4], bytes);
@@ -684,11 +707,15 @@ mod tests {
 
     #[test]
     fn decodes_ascii_varchar_as_utf8() {
-        let value = MssqlValue::new(MssqlTypeInfo::VARCHAR, Some(b"hello".to_vec()));
+        let value = MssqlValue::new(MssqlTypeInfo::VARCHAR, Some(Bytes::from_static(b"hello")));
 
         assert_eq!(
             "hello",
             <String as Decode<Mssql>>::decode(value.as_ref()).unwrap()
+        );
+        assert_eq!(
+            "hello",
+            <&str as Decode<Mssql>>::decode(value.as_ref()).unwrap()
         );
     }
 
@@ -699,11 +726,12 @@ mod tests {
             data.extend_from_slice(&unit.to_le_bytes());
         }
 
-        let value = MssqlValue::new(MssqlTypeInfo::NVARCHAR, Some(data));
+        let value = MssqlValue::new(MssqlTypeInfo::NVARCHAR, Some(Bytes::from(data)));
 
         assert_eq!(
             "hello",
             <String as Decode<Mssql>>::decode(value.as_ref()).unwrap()
         );
+        assert!(<&str as Decode<Mssql>>::decode(value.as_ref()).is_err());
     }
 }

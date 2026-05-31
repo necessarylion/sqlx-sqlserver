@@ -117,6 +117,11 @@ impl MssqlTypeInfo {
         }
     }
 
+    /// Returns the canonical SQL Server type family name.
+    pub fn name(&self) -> &str {
+        <Self as TypeInfo>::name(self)
+    }
+
     /// SQL `NULL` type information.
     pub const NULL: Self = Self::new(MssqlType::Null);
     /// SQL Server `bit` type information.

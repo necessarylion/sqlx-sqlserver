@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use sqlx_core::Error;
 
 use super::col_meta_data::Flags;
@@ -14,7 +15,7 @@ pub(crate) struct ReturnValue {
     user_type: u32,
     flags: Flags,
     pub(crate) type_info: TypeInfo,
-    pub(crate) value: Option<Vec<u8>>,
+    pub(crate) value: Option<Bytes>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +28,7 @@ impl ReturnValueStatus {
 }
 
 impl ReturnValue {
-    pub(crate) fn get(input: &mut &[u8]) -> Result<Self, Error> {
+    pub(crate) fn get(payload: &Bytes, input: &mut &[u8]) -> Result<Self, Error> {
         let param_ordinal = read_u16_le(input)?;
         let param_name = read_b_varchar(input)?;
         let status = ReturnValueStatus::from_bits_truncate(read_u8(input)?);
@@ -35,7 +36,7 @@ impl ReturnValue {
         let flags = Flags::from_bits_truncate(read_u16_le(input)?);
         let type_info = TypeInfo::get(input).map_err(|error| Error::Protocol(error.to_string()))?;
         let value = type_info
-            .get_value(input)
+            .get_value(payload, input)
             .map_err(|error| Error::Protocol(error.to_string()))?;
 
         Ok(Self {
@@ -61,7 +62,7 @@ mod tests {
 
     #[test]
     fn parses_return_value() {
-        let mut input = &[
+        let payload = Bytes::copy_from_slice(&[
             0,
             0, // ordinal
             0, // name
@@ -79,10 +80,11 @@ mod tests {
             0,
             0,
             0,
-        ][..];
+        ]);
+        let mut input = payload.as_ref();
 
-        let return_value = ReturnValue::get(&mut input).unwrap();
+        let return_value = ReturnValue::get(&payload, &mut input).unwrap();
 
-        assert_eq!(return_value.value, Some(vec![1, 0, 0, 0]));
+        assert_eq!(return_value.value, Some(Bytes::from_static(&[1, 0, 0, 0])));
     }
 }

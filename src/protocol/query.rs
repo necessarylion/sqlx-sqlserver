@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use sqlx_core::Error;
 use std::sync::Arc;
 
@@ -25,10 +26,101 @@ const TOKEN_DONEINPROC: u8 = 0xff;
 #[derive(Debug)]
 pub(crate) struct QueryOutput {
     pub(crate) columns: Vec<MssqlColumn>,
-    pub(crate) rows: Vec<MssqlRow>,
+    #[allow(dead_code)]
     pub(crate) result: MssqlQueryResult,
     pub(crate) return_values: Vec<MssqlValue>,
     pub(crate) env_changes: Vec<EnvChange>,
+}
+
+#[derive(Debug)]
+pub(crate) enum QueryEvent {
+    Columns(Vec<MssqlColumn>),
+    Row(MssqlRow),
+    Result(MssqlQueryResult),
+    ReturnValue(MssqlValue),
+    EnvChange(EnvChange),
+}
+
+#[derive(Debug)]
+pub(crate) struct QueryEvents {
+    payload: Bytes,
+    offset: usize,
+    columns: Arc<[MssqlColumn]>,
+}
+
+impl QueryEvents {
+    pub(crate) fn new(payload: impl Into<Bytes>) -> Self {
+        Self {
+            payload: payload.into(),
+            offset: 0,
+            columns: Arc::from(Vec::new()),
+        }
+    }
+
+    pub(crate) fn next(&mut self) -> Result<Option<QueryEvent>, Error> {
+        loop {
+            if self.offset >= self.payload.len() {
+                return Ok(None);
+            }
+
+            let mut input = &self.payload[self.offset..];
+            let token = read_u8(&mut input)?;
+            let event = match token {
+                TOKEN_COL_METADATA => {
+                    self.columns = ColMetaData::get(&mut input)?.into();
+                    Some(QueryEvent::Columns(self.columns.to_vec()))
+                }
+                TOKEN_ROW => Some(QueryEvent::Row(Row::get(
+                    &self.payload,
+                    &mut input,
+                    false,
+                    Arc::clone(&self.columns),
+                )?)),
+                TOKEN_NBCROW => Some(QueryEvent::Row(Row::get(
+                    &self.payload,
+                    &mut input,
+                    true,
+                    Arc::clone(&self.columns),
+                )?)),
+                TOKEN_RETURN_VALUE => Some(QueryEvent::ReturnValue(
+                    ReturnValue::get(&self.payload, &mut input)?.into_value(),
+                )),
+                TOKEN_RETURN_STATUS => {
+                    let _ = read_u32_le(&mut input)?;
+                    None
+                }
+                TOKEN_DONE | TOKEN_DONEPROC | TOKEN_DONEINPROC => {
+                    let done = Done::get(&mut input)?;
+                    done.status
+                        .contains(Status::DONE_COUNT)
+                        .then(|| QueryEvent::Result(MssqlQueryResult::new(done.affected_rows)))
+                }
+                TOKEN_ERROR => {
+                    let error = parse_server_error(read_len_prefixed(&mut input)?)
+                        .map_err(token_parse_error)?;
+                    return Err(server_error(error));
+                }
+                TOKEN_ENVCHANGE => Some(QueryEvent::EnvChange(
+                    parse_env_change(read_len_prefixed(&mut input)?).map_err(token_parse_error)?,
+                )),
+                TOKEN_INFO => {
+                    let _ = read_len_prefixed(&mut input)?;
+                    None
+                }
+                other => {
+                    return Err(Error::Protocol(format!(
+                        "unsupported SQL Server query token 0x{other:02x}"
+                    )));
+                }
+            };
+
+            self.offset = self.payload.len() - input.len();
+
+            if let Some(event) = event {
+                return Ok(Some(event));
+            }
+        }
+    }
 }
 
 pub(crate) fn build_sql_batch_packet(
@@ -47,56 +139,24 @@ pub(crate) fn build_sql_batch_packet(
 }
 
 pub(crate) fn parse_query_response(input: &[u8]) -> Result<QueryOutput, Error> {
-    let mut input = input;
-    let mut columns = Arc::<[MssqlColumn]>::from(Vec::new());
-    let mut rows = Vec::new();
+    let mut events = QueryEvents::new(Bytes::copy_from_slice(input));
+    let mut columns = Vec::new();
     let mut return_values = Vec::new();
     let mut env_changes = Vec::new();
     let mut rows_affected = 0;
 
-    while !input.is_empty() {
-        let token = read_u8(&mut input)?;
-
-        match token {
-            TOKEN_COL_METADATA => columns = ColMetaData::get(&mut input)?.into(),
-            TOKEN_ROW => rows.push(Row::get(&mut input, false, Arc::clone(&columns))?),
-            TOKEN_NBCROW => rows.push(Row::get(&mut input, true, Arc::clone(&columns))?),
-            TOKEN_RETURN_VALUE => {
-                return_values.push(ReturnValue::get(&mut input)?.into_value());
-            }
-            TOKEN_RETURN_STATUS => {
-                let _ = read_u32_le(&mut input)?;
-            }
-            TOKEN_DONE | TOKEN_DONEPROC | TOKEN_DONEINPROC => {
-                let done = Done::get(&mut input)?;
-                if done.status.contains(Status::DONE_COUNT) {
-                    rows_affected += done.affected_rows;
-                }
-            }
-            TOKEN_ERROR => {
-                let error = parse_server_error(read_len_prefixed(&mut input)?)
-                    .map_err(token_parse_error)?;
-                return Err(server_error(error));
-            }
-            TOKEN_ENVCHANGE => {
-                env_changes.push(
-                    parse_env_change(read_len_prefixed(&mut input)?).map_err(token_parse_error)?,
-                );
-            }
-            TOKEN_INFO => {
-                let _ = read_len_prefixed(&mut input)?;
-            }
-            other => {
-                return Err(Error::Protocol(format!(
-                    "unsupported SQL Server query token 0x{other:02x}"
-                )));
-            }
+    while let Some(event) = events.next()? {
+        match event {
+            QueryEvent::Columns(new_columns) => columns = new_columns,
+            QueryEvent::Row(_) => {}
+            QueryEvent::Result(result) => rows_affected += result.rows_affected(),
+            QueryEvent::ReturnValue(value) => return_values.push(value),
+            QueryEvent::EnvChange(env_change) => env_changes.push(env_change),
         }
     }
 
     Ok(QueryOutput {
-        columns: columns.to_vec(),
-        rows,
+        columns,
         result: MssqlQueryResult::new(rows_affected),
         return_values,
         env_changes,
@@ -153,34 +213,35 @@ mod tests {
     fn parses_select_one_response() {
         let response = [col_metadata_int(""), row_int(1), done(0x10, 0, 1)].concat();
         let output = parse_query_response(&response).unwrap();
+        let rows = parse_rows(&response);
 
-        assert_eq!(1, output.rows.len());
+        assert_eq!(1, rows.len());
         assert_eq!(1, output.result.rows_affected());
-        assert_eq!(1_i32, output.rows[0].try_get::<i32, _>(0).unwrap());
+        assert_eq!(1_i32, rows[0].try_get::<i32, _>(0).unwrap());
     }
 
     #[test]
     fn parses_variable_length_int_response() {
         let response = [col_metadata_intn(""), row_intn(7), done(0x10, 0, 1)].concat();
-        let output = parse_query_response(&response).unwrap();
+        let rows = parse_rows(&response);
 
-        assert_eq!(7_i32, output.rows[0].try_get::<i32, _>(0).unwrap());
+        assert_eq!(7_i32, rows[0].try_get::<i32, _>(0).unwrap());
     }
 
     #[test]
     fn parses_null_typed_value_as_null() {
         let response = [col_metadata_null("value"), row_null(), done(0x10, 0, 1)].concat();
-        let output = parse_query_response(&response).unwrap();
+        let rows = parse_rows(&response);
 
-        assert!(output.rows[0].try_get_raw(0).unwrap().is_null());
+        assert!(rows[0].try_get_raw(0).unwrap().is_null());
     }
 
     #[test]
     fn parses_nbcrow_null_bitmap() {
         let response = [col_metadata_intn("value"), nbcrow_null(1), done(0x10, 0, 1)].concat();
-        let output = parse_query_response(&response).unwrap();
+        let rows = parse_rows(&response);
 
-        assert!(output.rows[0].try_get_raw(0).unwrap().is_null());
+        assert!(rows[0].try_get_raw(0).unwrap().is_null());
     }
 
     #[test]
@@ -345,6 +406,19 @@ mod tests {
         out.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_le_bytes());
         out.extend_from_slice(&payload);
         out
+    }
+
+    fn parse_rows(response: &[u8]) -> Vec<MssqlRow> {
+        let mut events = QueryEvents::new(response.to_vec());
+        let mut rows = Vec::new();
+
+        while let Some(event) = events.next().unwrap() {
+            if let QueryEvent::Row(row) = event {
+                rows.push(row);
+            }
+        }
+
+        rows
     }
 
     fn done(status: u16, current_command: u16, row_count: u64) -> Vec<u8> {

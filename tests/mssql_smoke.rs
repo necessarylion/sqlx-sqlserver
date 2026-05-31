@@ -1,13 +1,23 @@
 use sqlx_sqlserver::MssqlConnectOptions;
 #[cfg(feature = "integration-tests")]
+use sqlx_sqlserver::MssqlPoolOptions;
+#[cfg(feature = "integration-tests")]
+use std::sync::atomic::{AtomicI32, Ordering};
+#[cfg(feature = "integration-tests")]
 use std::sync::Once;
+#[cfg(feature = "integration-tests")]
+use std::time::Duration;
 
+#[cfg(feature = "integration-tests")]
+use futures_util::TryStreamExt;
 #[cfg(feature = "integration-tests")]
 use sqlx_core::column::Column;
 #[cfg(feature = "integration-tests")]
 use sqlx_core::connection::{ConnectOptions, Connection};
 #[cfg(feature = "integration-tests")]
 use sqlx_core::executor::Executor;
+#[cfg(feature = "integration-tests")]
+use sqlx_core::query_builder::QueryBuilder;
 #[cfg(feature = "integration-tests")]
 use sqlx_core::row::Row;
 #[cfg(all(feature = "integration-tests", feature = "migrate"))]
@@ -18,6 +28,9 @@ use sqlx_core::statement::Statement;
 use sqlx_core::value::ValueRef;
 #[cfg(all(feature = "integration-tests", feature = "migrate"))]
 use std::borrow::Cow;
+
+// SQL Server query macros are intentionally not ported here; this crate does not
+// currently expose the macro integration needed for compile-time checked tests.
 
 fn database_url() -> Option<String> {
     std::env::var("MSSQL_DATABASE_URL")
@@ -189,6 +202,67 @@ async fn fetches_bound_scalars_when_configured() -> Result<(), Box<dyn std::erro
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+async fn fetches_1000_rows_when_configured() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(mut conn) = native_test_conn("SQL Server 1000 row fetch test").await? else {
+        return Ok(());
+    };
+
+    let mut rows = sqlx_core::query::query(
+        "WITH n(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM n WHERE v < 1000) \
+         SELECT v * 2 AS id FROM n OPTION (MAXRECURSION 1000)",
+    )
+    .fetch(&mut conn);
+
+    let mut count = 0;
+    let mut sum = 0_i32;
+    while let Some(row) = rows.try_next().await? {
+        count += 1;
+        sum += row.try_get::<i32, _>("id")?;
+    }
+    drop(rows);
+
+    assert_eq!(count, 1000);
+    assert_eq!(sum, 1_001_000);
+
+    conn.close().await?;
+    Ok(())
+}
+
+#[cfg(feature = "integration-tests")]
+#[tokio::test]
+async fn execute_reports_rows_affected_when_configured() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(mut conn) = native_test_conn("SQL Server rows affected test").await? else {
+        return Ok(());
+    };
+
+    conn.execute("CREATE TABLE #rows_affected (id INT NOT NULL)")
+        .await?;
+
+    let result = sqlx_core::query::query("INSERT INTO #rows_affected (id) VALUES (@p1)")
+        .bind(1_i32)
+        .execute(&mut conn)
+        .await?;
+    assert_eq!(result.rows_affected(), 1);
+
+    let result = sqlx_core::query::query("UPDATE #rows_affected SET id = @p1 WHERE id = @p2")
+        .bind(2_i32)
+        .bind(1_i32)
+        .execute(&mut conn)
+        .await?;
+    assert_eq!(result.rows_affected(), 1);
+
+    let result = sqlx_core::query::query("DELETE FROM #rows_affected WHERE id = @p1")
+        .bind(2_i32)
+        .execute(&mut conn)
+        .await?;
+    assert_eq!(result.rows_affected(), 1);
+
+    conn.close().await?;
+    Ok(())
+}
+
+#[cfg(feature = "integration-tests")]
+#[tokio::test]
 async fn fetches_bound_large_text_and_binary_when_configured(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(mut conn) = native_test_conn("SQL Server large parameter test").await? else {
@@ -211,6 +285,46 @@ async fn fetches_bound_large_text_and_binary_when_configured(
         .await?;
 
     assert_eq!(8001_i64, row.try_get::<i64, _>(0)?);
+
+    conn.close().await?;
+    Ok(())
+}
+
+#[cfg(feature = "integration-tests")]
+#[tokio::test]
+async fn fetches_string_with_special_chars_when_configured(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(mut conn) = native_test_conn("SQL Server special string test").await? else {
+        return Ok(());
+    };
+
+    let expected = "/\r\n\t\0\x1b!@#$/.%^\x1b&*()_+";
+    let row = sqlx_core::query::query("SELECT @p1")
+        .bind(expected)
+        .fetch_one(&mut conn)
+        .await?;
+
+    assert_eq!(expected, row.try_get::<String, _>(0)?);
+
+    conn.close().await?;
+    Ok(())
+}
+
+#[cfg(feature = "integration-tests")]
+#[tokio::test]
+async fn accepts_long_query_strings_when_configured() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(mut conn) = native_test_conn("SQL Server long query string test").await? else {
+        return Ok(());
+    };
+
+    let row = sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+        "SELECT {} 42",
+        " ".repeat(3000)
+    )))
+    .fetch_one(&mut conn)
+    .await?;
+
+    assert_eq!(42_i32, row.try_get::<i32, _>(0)?);
 
     conn.close().await?;
     Ok(())
@@ -529,11 +643,51 @@ async fn prepares_statement_metadata_when_configured() -> Result<(), Box<dyn std
     };
 
     let statement = conn
-        .prepare(sqlx_core::sql_str::SqlStr::from_static("SELECT 1 AS value"))
+        .prepare(sqlx_core::sql_str::SqlStr::from_static(
+            "SELECT CAST(1 AS BIGINT) AS id, CAST(N'text' AS NVARCHAR(20)) AS text, CAST(0 AS TINYINT) AS is_sent, CAST(NULL AS BIGINT) AS owner_id",
+        ))
         .await?;
 
-    assert_eq!(1, statement.columns().len());
-    assert_eq!("value", statement.columns()[0].name());
+    assert_eq!(4, statement.columns().len());
+    assert_eq!("id", statement.columns()[0].name());
+    assert_eq!("text", statement.columns()[1].name());
+    assert_eq!("is_sent", statement.columns()[2].name());
+    assert_eq!("owner_id", statement.columns()[3].name());
+    assert_eq!("BIGINT", statement.columns()[0].type_info().name());
+    assert_eq!("NVARCHAR", statement.columns()[1].type_info().name());
+    assert_eq!("TINYINT", statement.columns()[2].type_info().name());
+    assert_eq!("BIGINT", statement.columns()[3].type_info().name());
+
+    conn.close().await?;
+    Ok(())
+}
+
+#[cfg(feature = "integration-tests")]
+#[tokio::test]
+async fn prepares_then_statement_query_when_configured() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(mut conn) = native_test_conn("SQL Server statement query test").await? else {
+        return Ok(());
+    };
+
+    let statement = (&mut conn)
+        .prepare(sqlx_core::sql_str::SqlStr::from_static(
+            "SELECT @p1 AS id, @p2 AS text",
+        ))
+        .await?;
+
+    assert_eq!(2, statement.columns().len());
+    assert_eq!("id", statement.columns()[0].name());
+    assert_eq!("text", statement.columns()[1].name());
+
+    let row = statement
+        .query()
+        .bind(50_i64)
+        .bind("Hello, World")
+        .fetch_one(&mut conn)
+        .await?;
+
+    assert_eq!(50_i64, row.try_get::<i64, _>("id")?);
+    assert_eq!("Hello, World", row.try_get::<String, _>("text")?);
 
     conn.close().await?;
     Ok(())
@@ -549,6 +703,64 @@ async fn rolls_back_transaction_when_configured() -> Result<(), Box<dyn std::err
     let tx = conn.begin().await?;
     tx.rollback().await?;
 
+    conn.close().await?;
+    Ok(())
+}
+
+#[cfg(feature = "integration-tests")]
+#[tokio::test]
+async fn supports_nested_transactions_when_configured() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(mut conn) = native_test_conn("SQL Server nested transaction test").await? else {
+        return Ok(());
+    };
+
+    let table_name = "_sqlx_nested_tx_smoke";
+    conn.execute(sqlx_core::sql_str::AssertSqlSafe(format!(
+        "DROP TABLE IF EXISTS {table_name}"
+    )))
+    .await?;
+    conn.execute(sqlx_core::sql_str::AssertSqlSafe(format!(
+        "CREATE TABLE {table_name} (id INT NOT NULL PRIMARY KEY)"
+    )))
+    .await?;
+
+    let mut tx = conn.begin().await?;
+    sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+        "INSERT INTO {table_name} (id) VALUES (@p1)"
+    )))
+    .bind(50_i32)
+    .execute(&mut *tx)
+    .await?;
+
+    let mut tx2 = sqlx_core::acquire::Acquire::begin(&mut tx).await?;
+    sqlx_core::query::query(sqlx_core::sql_str::AssertSqlSafe(format!(
+        "INSERT INTO {table_name} (id) VALUES (@p1)"
+    )))
+    .bind(10_i32)
+    .execute(&mut *tx2)
+    .await?;
+    tx2.rollback().await?;
+
+    let count: i32 = sqlx_core::query_scalar::query_scalar(sqlx_core::sql_str::AssertSqlSafe(
+        format!("SELECT COUNT(*) FROM {table_name}"),
+    ))
+    .fetch_one(&mut *tx)
+    .await?;
+    assert_eq!(1, count);
+
+    tx.commit().await?;
+
+    let count: i32 = sqlx_core::query_scalar::query_scalar(sqlx_core::sql_str::AssertSqlSafe(
+        format!("SELECT COUNT(*) FROM {table_name}"),
+    ))
+    .fetch_one(&mut conn)
+    .await?;
+    assert_eq!(1, count);
+
+    conn.execute(sqlx_core::sql_str::AssertSqlSafe(format!(
+        "DROP TABLE IF EXISTS {table_name}"
+    )))
+    .await?;
     conn.close().await?;
     Ok(())
 }
@@ -594,6 +806,206 @@ async fn dropped_transaction_rolls_back_on_next_use() -> Result<(), Box<dyn std:
             "DROP TABLE IF EXISTS {table_name}"
         )))
         .await?;
+    conn.close().await?;
+    Ok(())
+}
+
+#[cfg(feature = "integration-tests")]
+#[tokio::test]
+async fn pool_callbacks_when_configured() -> Result<(), Box<dyn std::error::Error>> {
+    #[derive(Debug, PartialEq, Eq)]
+    struct ConnStats {
+        id: i32,
+        before_acquire_calls: i32,
+        after_release_calls: i32,
+    }
+
+    async fn conn_stats(
+        conn: &mut sqlx_sqlserver::MssqlConnection,
+    ) -> Result<ConnStats, sqlx_core::error::Error> {
+        let row = sqlx_core::query::query(
+            "SELECT id, before_acquire_calls, after_release_calls FROM #conn_stats",
+        )
+        .fetch_one(conn)
+        .await?;
+
+        Ok(ConnStats {
+            id: row.try_get("id")?,
+            before_acquire_calls: row.try_get("before_acquire_calls")?,
+            after_release_calls: row.try_get("after_release_calls")?,
+        })
+    }
+
+    let Some(url) = database_url() else {
+        eprintln!("skipping SQL Server pool callbacks test: MSSQL_DATABASE_URL is not set");
+        return Ok(());
+    };
+
+    let current_id = AtomicI32::new(0);
+
+    let pool = MssqlPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(5))
+        .after_connect(move |conn, meta| {
+            assert_eq!(meta.age, Duration::ZERO);
+            assert_eq!(meta.idle_for, Duration::ZERO);
+
+            let id = current_id.fetch_add(1, Ordering::AcqRel);
+
+            Box::pin(async move {
+                conn.execute(sqlx_core::sql_str::AssertSqlSafe(format!(
+                    "CREATE TABLE #conn_stats(
+                        id int primary key,
+                        before_acquire_calls int default 0,
+                        after_release_calls int default 0
+                    );
+                    INSERT INTO #conn_stats(id) VALUES ({id});"
+                )))
+                .await?;
+                Ok(())
+            })
+        })
+        .before_acquire(|conn, meta| {
+            assert_ne!(meta.age, Duration::ZERO);
+            assert_ne!(meta.idle_for, Duration::ZERO);
+
+            Box::pin(async move {
+                sqlx_core::query::query(
+                    "UPDATE #conn_stats SET before_acquire_calls = before_acquire_calls + 1",
+                )
+                .execute(&mut *conn)
+                .await?;
+
+                let stats = conn_stats(conn).await?;
+                Ok((stats.id & 1) == 1 || stats.before_acquire_calls < 3)
+            })
+        })
+        .after_release(|conn, meta| {
+            assert_ne!(meta.age, Duration::ZERO);
+            assert_eq!(meta.idle_for, Duration::ZERO);
+
+            Box::pin(async move {
+                sqlx_core::query::query(
+                    "UPDATE #conn_stats SET after_release_calls = after_release_calls + 1",
+                )
+                .execute(&mut *conn)
+                .await?;
+
+                let stats = conn_stats(conn).await?;
+                Ok((stats.id & 1) == 0 || stats.after_release_calls < 4)
+            })
+        })
+        .connect_lazy(&url)?;
+
+    let pattern = [
+        (0, 0, 0),
+        (0, 1, 1),
+        (0, 2, 2),
+        (1, 0, 0),
+        (1, 1, 1),
+        (1, 2, 2),
+        (1, 3, 3),
+        (2, 0, 0),
+        (2, 1, 1),
+        (2, 2, 2),
+        (3, 0, 0),
+    ];
+
+    for (id, before_acquire_calls, after_release_calls) in pattern {
+        let row = sqlx_core::query::query(
+            "SELECT id, before_acquire_calls, after_release_calls FROM #conn_stats",
+        )
+        .fetch_one(&pool)
+        .await?;
+
+        assert_eq!(
+            ConnStats {
+                id,
+                before_acquire_calls,
+                after_release_calls,
+            },
+            ConnStats {
+                id: row.try_get("id")?,
+                before_acquire_calls: row.try_get("before_acquire_calls")?,
+                after_release_calls: row.try_get("after_release_calls")?,
+            }
+        );
+    }
+
+    pool.close().await;
+    Ok(())
+}
+
+#[cfg(feature = "integration-tests")]
+#[tokio::test]
+async fn query_builder_binds_mssql_placeholders_when_configured(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(mut conn) = native_test_conn("SQL Server QueryBuilder test").await? else {
+        return Ok(());
+    };
+
+    conn.execute("CREATE TABLE #qb_test (id INT PRIMARY KEY, name NVARCHAR(50))")
+        .await?;
+
+    let items = [(1_i32, "Alice"), (2_i32, "Bob"), (3_i32, "Charlie")];
+    let mut insert_builder =
+        QueryBuilder::<sqlx_sqlserver::Mssql>::new("INSERT INTO #qb_test (id, name) ");
+    insert_builder.push_values(items.iter(), |mut row, (id, name)| {
+        row.push_bind(*id).push_bind(*name);
+    });
+
+    assert_eq!(
+        "INSERT INTO #qb_test (id, name) VALUES (@p1, @p2), (@p3, @p4), (@p5, @p6)",
+        insert_builder.sql().as_str()
+    );
+    let insert_query = insert_builder.build();
+    insert_query.execute(&mut conn).await?;
+
+    let mut select_builder =
+        QueryBuilder::<sqlx_sqlserver::Mssql>::new("SELECT id, name FROM #qb_test WHERE id=");
+    select_builder.push_bind(2_i32);
+    let row = select_builder.build().fetch_one(&mut conn).await?;
+    assert_eq!(2_i32, row.try_get::<i32, _>("id")?);
+    assert_eq!("Bob", row.try_get::<String, _>("name")?);
+
+    let mut issue_builder =
+        QueryBuilder::<sqlx_sqlserver::Mssql>::new("SELECT id, name FROM #qb_test ");
+    issue_builder
+        .push("WHERE id=")
+        .push_bind(1_i32)
+        .push(" AND name=")
+        .push_bind("Alice");
+    assert_eq!(
+        "SELECT id, name FROM #qb_test WHERE id=@p1 AND name=@p2",
+        issue_builder.sql().as_str()
+    );
+    let issue_query = issue_builder.build();
+    let row = issue_query.fetch_one(&mut conn).await?;
+    assert_eq!(1_i32, row.try_get::<i32, _>("id")?);
+    assert_eq!("Alice", row.try_get::<String, _>("name")?);
+
+    conn.close().await?;
+    Ok(())
+}
+
+#[cfg(feature = "integration-tests")]
+#[tokio::test]
+async fn inspects_database_errors_when_configured() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(mut conn) = native_test_conn("SQL Server database error inspection test").await?
+    else {
+        return Ok(());
+    };
+
+    let error = sqlx_core::query::query("select\nf")
+        .execute(&mut conn)
+        .await
+        .expect_err("invalid query should fail");
+    let database_error = error
+        .into_database_error()
+        .expect("invalid SQL should return a database error");
+
+    assert_eq!("Invalid column name 'f'.", database_error.message());
+
     conn.close().await?;
     Ok(())
 }

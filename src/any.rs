@@ -9,7 +9,7 @@ use crate::{
 };
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
-use futures_util::{future, stream, FutureExt, StreamExt};
+use futures_util::{FutureExt, StreamExt, TryStreamExt};
 use sqlx_core::any::driver::AnyDriver;
 use sqlx_core::any::{
     AnyArguments, AnyColumn, AnyConnectOptions, AnyConnectionBackend, AnyQueryResult, AnyRow,
@@ -92,27 +92,20 @@ impl AnyConnectionBackend for MssqlConnection {
         _persistent: bool,
         arguments: Option<AnyArguments>,
     ) -> BoxStream<'_, sqlx_core::Result<Either<AnyQueryResult, AnyRow>>> {
-        stream::once(async move {
-            let native_arguments = arguments
-                .map(convert_any_arguments)
-                .transpose()
-                .map_err(Error::Encode)?;
-            self.run_execute_sql(query.as_str(), native_arguments.as_ref())
-                .await
-        })
-        .map(|result| match result {
-            Ok(output) => {
-                let column_names = column_names(&output.columns);
-                let rows = output.rows.into_iter().map(move |row| {
-                    AnyRow::map_from(&row, Arc::clone(&column_names)).map(Either::Right)
-                });
-                let done = std::iter::once(Ok(Either::Left(map_result(output.result))));
-                stream::iter(rows.chain(done)).boxed()
-            }
-            Err(error) => stream::once(future::ready(Err(error))).boxed(),
-        })
-        .flatten()
-        .boxed()
+        let native_arguments = arguments
+            .map(convert_any_arguments)
+            .transpose()
+            .map_err(Error::Encode);
+
+        self.fetch_many_sql(query, native_arguments)
+            .map(|item| match item? {
+                Either::Left(result) => Ok(Either::Left(map_result(result))),
+                Either::Right(row) => {
+                    let column_names = column_names(row.columns());
+                    AnyRow::map_from(&row, column_names).map(Either::Right)
+                }
+            })
+            .boxed()
     }
 
     fn fetch_optional(
@@ -126,16 +119,16 @@ impl AnyConnectionBackend for MssqlConnection {
                 .map(convert_any_arguments)
                 .transpose()
                 .map_err(Error::Encode)?;
-            self.run_execute_sql(query.as_str(), native_arguments.as_ref())
-                .await?
-                .rows
-                .into_iter()
-                .next()
-                .map(|row| {
+            let mut stream = self.fetch_many_sql(query, Ok(native_arguments));
+
+            while let Some(item) = stream.try_next().await? {
+                if let Either::Right(row) = item {
                     let column_names = column_names(row.columns());
-                    AnyRow::map_from(&row, column_names)
-                })
-                .transpose()
+                    return AnyRow::map_from(&row, column_names).map(Some);
+                }
+            }
+
+            Ok(None)
         })
     }
 

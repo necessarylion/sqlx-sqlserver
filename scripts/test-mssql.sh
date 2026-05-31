@@ -5,12 +5,12 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
 : "${MSSQL_DATABASE_URL:?set MSSQL_DATABASE_URL to run SQL Server integration tests}"
 
-cargo test --locked --features integration-tests --test mssql_smoke --no-run
+cargo test --locked --features integration-tests,runtime-tokio --test mssql_smoke --no-run
 
 deadline=$((SECONDS + 120))
 while true
 do
-    output="$(cargo test --locked --features integration-tests --test mssql_smoke \
+    output="$(cargo test --locked --features integration-tests,runtime-tokio --test mssql_smoke \
         connects_and_pings_when_configured -- --exact 2>&1)" && {
         printf '%s\n' "$output"
         break
@@ -32,4 +32,4 @@ do
     sleep 5
 done
 
-cargo test --locked --features integration-tests --test mssql_smoke
+cargo test --locked --features integration-tests,runtime-tokio --test mssql_smoke
