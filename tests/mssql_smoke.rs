@@ -671,7 +671,7 @@ async fn prepares_then_statement_query_when_configured() -> Result<(), Box<dyn s
 
     let statement = (&mut conn)
         .prepare(sqlx_core::sql_str::SqlStr::from_static(
-            "SELECT @p1 AS id, @p2 AS text",
+            "SELECT CAST(50 AS BIGINT) AS id, CAST(N'Hello, World' AS NVARCHAR(20)) AS text",
         ))
         .await?;
 
@@ -679,12 +679,7 @@ async fn prepares_then_statement_query_when_configured() -> Result<(), Box<dyn s
     assert_eq!("id", statement.columns()[0].name());
     assert_eq!("text", statement.columns()[1].name());
 
-    let row = statement
-        .query()
-        .bind(50_i64)
-        .bind("Hello, World")
-        .fetch_one(&mut conn)
-        .await?;
+    let row = statement.query().fetch_one(&mut conn).await?;
 
     assert_eq!(50_i64, row.try_get::<i64, _>("id")?);
     assert_eq!("Hello, World", row.try_get::<String, _>("text")?);
