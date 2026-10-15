@@ -28,7 +28,15 @@ use sqlx_core::{Either, Error, HashMap};
 use std::sync::Arc;
 
 /// Installable SQL Server driver for SQLx `Any` connections.
+///
+/// Migrations are only wired in with this crate's own `migrate` feature. Another
+/// crate may turn on `sqlx-core/migrate` without it, and that must still build.
+#[cfg(feature = "migrate")]
 pub const DRIVER: AnyDriver = AnyDriver::with_migrate::<Mssql>();
+
+/// Installable SQL Server driver for SQLx `Any` connections.
+#[cfg(not(feature = "migrate"))]
+pub const DRIVER: AnyDriver = AnyDriver::without_migrate::<Mssql>();
 
 impl AnyConnectionBackend for MssqlConnection {
     fn name(&self) -> &str {
