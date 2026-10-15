@@ -16,6 +16,9 @@ const TOKEN_ERROR: u8 = 0xaa;
 const TOKEN_INFO: u8 = 0xab;
 const TOKEN_RETURN_STATUS: u8 = 0x79;
 const TOKEN_RETURN_VALUE: u8 = 0xac;
+const TOKEN_TABNAME: u8 = 0xa4;
+const TOKEN_COLINFO: u8 = 0xa5;
+const TOKEN_ORDER: u8 = 0xa9;
 const TOKEN_ROW: u8 = 0xd1;
 const TOKEN_NBCROW: u8 = 0xd2;
 const TOKEN_ENVCHANGE: u8 = 0xe3;
@@ -103,7 +106,9 @@ impl QueryEvents {
                 TOKEN_ENVCHANGE => Some(QueryEvent::EnvChange(
                     parse_env_change(read_len_prefixed(&mut input)?).map_err(token_parse_error)?,
                 )),
-                TOKEN_INFO => {
+                // ORDER comes with ORDER BY. TABNAME and COLINFO come with browse
+                // mode. We do not need them, so skip them like INFO.
+                TOKEN_INFO | TOKEN_ORDER | TOKEN_TABNAME | TOKEN_COLINFO => {
                     let _ = read_len_prefixed(&mut input)?;
                     None
                 }
@@ -221,6 +226,23 @@ mod tests {
     }
 
     #[test]
+    fn skips_order_tabname_and_colinfo_tokens() {
+        let response = [
+            col_metadata_int(""),
+            len_prefixed(TOKEN_ORDER, &1_u16.to_le_bytes()),
+            len_prefixed(TOKEN_TABNAME, &[0; 4]),
+            len_prefixed(TOKEN_COLINFO, &[1, 1, 0]),
+            row_int(1),
+            done(0x10, 0, 1),
+        ]
+        .concat();
+        let rows = parse_rows(&response);
+
+        assert_eq!(1, rows.len());
+        assert_eq!(1_i32, rows[0].try_get::<i32, _>(0).unwrap());
+    }
+
+    #[test]
     fn parses_variable_length_int_response() {
         let response = [col_metadata_intn(""), row_intn(7), done(0x10, 0, 1)].concat();
         let rows = parse_rows(&response);
@@ -323,6 +345,13 @@ mod tests {
         out.extend_from_slice(&0_u16.to_le_bytes());
         out.push(crate::protocol::type_info::DataType::Null as u8);
         push_b_varchar(&mut out, name);
+        out
+    }
+
+    fn len_prefixed(token: u8, data: &[u8]) -> Vec<u8> {
+        let mut out = vec![token];
+        out.extend_from_slice(&u16::try_from(data.len()).unwrap().to_le_bytes());
+        out.extend_from_slice(data);
         out
     }
 

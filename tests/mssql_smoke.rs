@@ -235,6 +235,33 @@ async fn fetches_bound_scalars_when_configured() -> Result<(), Box<dyn std::erro
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+async fn fetches_order_by_queries_when_configured() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(mut conn) = native_test_conn("SQL Server ORDER BY test").await? else {
+        return Ok(());
+    };
+
+    let names = sqlx_core::query::query("SELECT TOP 2 name FROM sys.databases ORDER BY name DESC")
+        .fetch_all(&mut conn)
+        .await?;
+    assert_eq!(2, names.len());
+    assert!(names[0].try_get::<String, _>(0)? > names[1].try_get::<String, _>(0)?);
+
+    let rows = sqlx_core::raw_sql::raw_sql(
+        "SELECT * FROM (VALUES (2),(1),(3)) v(a) ORDER BY a OFFSET 1 ROWS FETCH NEXT 1 ROWS ONLY; \
+         SELECT COUNT(*) FROM sys.databases",
+    )
+    .fetch_all(&mut conn)
+    .await?;
+    assert_eq!(2, rows.len());
+    assert_eq!(2_i32, rows[0].try_get::<i32, _>(0)?);
+    assert!(rows[1].try_get::<i32, _>(0)? > 0);
+
+    conn.close().await?;
+    Ok(())
+}
+
+#[cfg(feature = "integration-tests")]
+#[tokio::test]
 async fn fetches_1000_rows_when_configured() -> Result<(), Box<dyn std::error::Error>> {
     let Some(mut conn) = native_test_conn("SQL Server 1000 row fetch test").await? else {
         return Ok(());
