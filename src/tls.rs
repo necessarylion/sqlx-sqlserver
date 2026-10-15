@@ -16,6 +16,7 @@ pub(crate) struct TlsPreloginStream<S> {
     header_pos: usize,
     read_remaining: usize,
     write_buf: Vec<u8>,
+    send_buf: Vec<u8>,
 }
 
 impl<S> TlsPreloginStream<S> {
@@ -27,6 +28,7 @@ impl<S> TlsPreloginStream<S> {
             header_pos: 0,
             read_remaining: 0,
             write_buf: Vec::new(),
+            send_buf: Vec::new(),
         }
     }
 
@@ -36,6 +38,35 @@ impl<S> TlsPreloginStream<S> {
 
     pub(crate) fn finish_handshake(&mut self) {
         self.handshake = false;
+    }
+}
+
+impl<S: AsyncWrite + Unpin> TlsPreloginStream<S> {
+    /// Sends the buffered TLS handshake bytes as one PRELOGIN message.
+    ///
+    /// SQL Server closes the connection when one TLS flight is split over
+    /// several PRELOGIN messages. Some TLS backends (Secure Transport on macOS)
+    /// flush after every TLS record, so we do not send on flush. We send when
+    /// the TLS engine wants to read the answer, which is the end of a flight.
+    fn poll_send_handshake(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.send_buf.is_empty() && !self.write_buf.is_empty() {
+            self.send_buf =
+                wrap_prelogin_tls_payload(&self.write_buf, 4096).map_err(packet_frame_error)?;
+            self.write_buf.clear();
+        }
+
+        while !self.send_buf.is_empty() {
+            let written = ready!(Pin::new(&mut self.stream).poll_write(cx, &self.send_buf))?;
+            if written == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write TLS handshake packet",
+                )));
+            }
+            self.send_buf.drain(..written);
+        }
+
+        Pin::new(&mut self.stream).poll_flush(cx)
     }
 }
 
@@ -62,6 +93,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TlsPreloginStream<S> {
         if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
+
+        ready!(self.poll_send_handshake(cx))?;
 
         if self.read_remaining == 0 {
             while self.header_pos < PACKET_HEADER_LEN {
@@ -131,6 +164,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsPreloginStream<S> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         if !self.handshake {
+            // The last handshake flight can still be buffered here.
+            ready!(self.poll_send_handshake(cx))?;
             return Pin::new(&mut self.stream).poll_write(cx, buf);
         }
 
@@ -139,28 +174,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for TlsPreloginStream<S> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.handshake && !self.write_buf.is_empty() {
-            let payload = std::mem::take(&mut self.write_buf);
-            self.write_buf =
-                wrap_prelogin_tls_payload(&payload, 4096).map_err(packet_frame_error)?;
-
-            while !self.write_buf.is_empty() {
-                let write_buf = std::mem::take(&mut self.write_buf);
-                let written = ready!(Pin::new(&mut self.stream).poll_write(cx, &write_buf))?;
-                if written == 0 {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "failed to write TLS handshake packet",
-                    )));
-                }
-
-                if written < write_buf.len() {
-                    self.write_buf.extend_from_slice(&write_buf[written..]);
-                }
-            }
+        if self.handshake {
+            return Pin::new(&mut self.stream).poll_flush(cx);
         }
 
-        Pin::new(&mut self.stream).poll_flush(cx)
+        self.poll_send_handshake(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -198,5 +216,34 @@ mod tests {
         assert_eq!(PacketType::PRE_LOGIN, header.packet_type);
         assert_eq!(PACKET_HEADER_LEN + 5, usize::from(header.length));
         assert_eq!(b"hello", &packet[PACKET_HEADER_LEN..]);
+    }
+
+    #[tokio::test]
+    async fn sends_one_tls_flight_as_one_prelogin_packet() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let mut stream = TlsPreloginStream::new(client);
+        stream.start_handshake();
+
+        // Secure Transport writes and flushes each TLS record on its own.
+        stream.write_all(b"first").await.unwrap();
+        stream.flush().await.unwrap();
+        stream.write_all(b"second").await.unwrap();
+        stream.flush().await.unwrap();
+
+        // The TLS engine now waits for the server answer.
+        let reply = encode_message(PacketType::PRE_LOGIN, b"ok", 512).unwrap();
+        server.write_all(&reply).await.unwrap();
+        let mut answer = [0; 2];
+        stream.read_exact(&mut answer).await.unwrap();
+        assert_eq!(b"ok", &answer);
+
+        let mut packet = vec![0; PACKET_HEADER_LEN + 11];
+        server.read_exact(&mut packet).await.unwrap();
+        let header = PacketHeader::decode(&packet[..PACKET_HEADER_LEN]).unwrap();
+        assert_eq!(PacketType::PRE_LOGIN, header.packet_type);
+        assert_eq!(packet.len(), usize::from(header.length));
+        assert_eq!(b"firstsecond", &packet[PACKET_HEADER_LEN..]);
     }
 }

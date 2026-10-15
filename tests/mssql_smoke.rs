@@ -114,6 +114,39 @@ async fn connects_and_pings_when_configured() -> Result<(), Box<dyn std::error::
 
 #[cfg(feature = "integration-tests")]
 #[tokio::test]
+async fn encrypts_connection_when_requested() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(url) = database_url() else {
+        eprintln!("skipping SQL Server TLS test: MSSQL_DATABASE_URL is not set");
+        return Ok(());
+    };
+    let options = url.parse::<MssqlConnectOptions>()?;
+    let mut conn = options.connect().await?;
+
+    let row = sqlx_core::query::query(
+        "SELECT encrypt_option FROM sys.dm_exec_connections WHERE session_id = @@SPID",
+    )
+    .fetch_one(&mut conn)
+    .await?;
+    let encrypted = row.try_get::<String, _>(0)? == "TRUE";
+    let requested = matches!(
+        options.encrypt(),
+        sqlx_sqlserver::Encrypt::On | sqlx_sqlserver::Encrypt::Required
+    );
+
+    // With encrypt=optional the server can still pick TLS, so only check one way.
+    if requested {
+        assert!(
+            encrypted,
+            "the URL asks for TLS, but the connection is not encrypted"
+        );
+    }
+
+    conn.close().await?;
+    Ok(())
+}
+
+#[cfg(feature = "integration-tests")]
+#[tokio::test]
 async fn fetches_select_one_when_configured() -> Result<(), Box<dyn std::error::Error>> {
     let Some(mut conn) = native_test_conn("SQL Server query test").await? else {
         return Ok(());
