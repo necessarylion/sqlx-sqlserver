@@ -103,14 +103,17 @@ impl MssqlTypeInfo {
         self.protocol_type_info.as_ref()
     }
 
-    pub(crate) const fn scale(&self) -> u8 {
+    /// Returns the scale: the digits after the decimal point of a `decimal`,
+    /// or of the seconds of a `time`, `datetime2` or `datetimeoffset`.
+    pub const fn scale(&self) -> u8 {
         match &self.protocol_type_info {
             Some(protocol_type_info) => protocol_type_info.scale,
             None => 0,
         }
     }
 
-    pub(crate) const fn precision(&self) -> u8 {
+    /// Returns the precision: the total number of digits of a `decimal`.
+    pub const fn precision(&self) -> u8 {
         match &self.protocol_type_info {
             Some(protocol_type_info) => protocol_type_info.precision,
             None => 0,
